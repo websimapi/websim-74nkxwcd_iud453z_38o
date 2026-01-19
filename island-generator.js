@@ -15,7 +15,7 @@ export class IslandGenerator {
         this._dummyQ = new THREE.Quaternion();
 
         // Sand Simulation (RTT)
-        this.simRes = 256;
+        this.simRes = 512; // Higher res for particle detail
         this.simScene = new THREE.Scene();
         this.simCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
         this.rtA = new THREE.WebGLRenderTarget(this.simRes, this.simRes, { 
@@ -58,20 +58,48 @@ export class IslandGenerator {
                     vec4 prev = texture2D(uPrev, vUv);
                     float h = prev.r;
                     
-                    // Natural Decay (Memory Sand)
-                    // Decays very slowly to 0
-                    h *= 0.998;
+                    // Diffusion/Settling - sand spreads to neighbors
+                    float texelSize = 1.0 / 512.0;
+                    float n = texture2D(uPrev, vUv + vec2(0.0, texelSize)).r;
+                    float s = texture2D(uPrev, vUv + vec2(0.0, -texelSize)).r;
+                    float e = texture2D(uPrev, vUv + vec2(texelSize, 0.0)).r;
+                    float w = texture2D(uPrev, vUv + vec2(-texelSize, 0.0)).r;
+                    
+                    // Cellular automata-like settling
+                    float avgNeighbor = (n + s + e + w) * 0.25;
+                    float diff = avgNeighbor - h;
+                    
+                    // If neighbors are higher, sand flows in (sedimentation)
+                    if (diff > 0.02) {
+                        h += diff * 0.15;
+                    }
+                    
+                    // Natural Decay (Memory Sand) - very slow
+                    h *= 0.9995;
+
+                    // Height Clamping per Region
+                    // Base height constraint from local noise
+                    float baseNoise = rand(floor(vUv * 8.0) / 8.0);
+                    float minH = 0.0;
+                    float maxH = 0.3 + baseNoise * 0.4; // Varies per region
+                    
+                    h = clamp(h, minH, maxH);
 
                     // Draw Snake
-                    // Only draw if UV is valid
                     if (uSnakeUV.x >= 0.0 && uSnakeUV.x <= 1.0) {
                         float dist = distance(vUv, uSnakeUV);
                         if (dist < uBrushSize) {
-                            // Smooth brush
-                            float intensity = smoothstep(uBrushSize, uBrushSize * 0.5, dist);
-                            // Add noise to brush for particle feel
-                            float noise = rand(vUv * 100.0 + uTime);
-                            h = max(h, intensity * (0.8 + 0.2 * noise));
+                            // Multi-scale brush for particle detail
+                            float intensity = smoothstep(uBrushSize, uBrushSize * 0.3, dist);
+                            
+                            // High-freq particle noise
+                            float particleNoise = rand(vUv * 200.0 + uTime * 0.1);
+                            float mediumNoise = rand(vUv * 50.0 + uTime * 0.05);
+                            
+                            // Layered disturbance
+                            float disturbance = intensity * (0.5 + 0.3 * mediumNoise + 0.2 * particleNoise);
+                            
+                            h = max(h, disturbance);
                         }
                     }
                     
@@ -264,25 +292,43 @@ export class IslandGenerator {
                     }
                     
                     // 2. Sand Detail (Particle Wise)
-                    // High frequency grain
-                    float grain = rand(vSandUV * 200.0);
-                    gl_FragColor.rgb *= (0.95 + 0.1 * grain);
+                    // Multi-scale grain for realism
+                    float grain1 = rand(vSandUV * 400.0);
+                    float grain2 = rand(vSandUV * 150.0);
+                    float grain3 = rand(vSandUV * 50.0);
+                    float combinedGrain = grain1 * 0.5 + grain2 * 0.3 + grain3 * 0.2;
                     
-                    // Sparkles (Sun glint on grains)
-                    // View vector approx?
-                    // Let's just make it view-dependent sparkling based on high freq noise
-                    float sparkle = smoothstep(0.98, 1.0, rand(vWorldPos.xy * 50.0 + vWorldPos.z * 50.0 + uTime * 0.1));
-                    gl_FragColor.rgb += vec3(sparkle * 0.15);
+                    gl_FragColor.rgb *= (0.92 + 0.16 * combinedGrain);
+                    
+                    // Sparkles (Sun glint on individual grains)
+                    float sparkleNoise = rand(vWorldPos.xy * 100.0 + vWorldPos.z * 100.0 + uTime * 0.05);
+                    float sparkle = smoothstep(0.985, 1.0, sparkleNoise);
+                    gl_FragColor.rgb += vec3(0.2, 0.18, 0.15) * sparkle;
 
                     // 3. Snake Trail (Sediment / Disturbance)
                     float track = texture2D(uSandMap, vSandUV).r;
                     if (track > 0.01) {
-                        // Darker in the track (shadow/wetness underneath)
-                        gl_FragColor.rgb *= (1.0 - track * 0.3);
+                        // Deeper depression shows darker base sand
+                        float depression = smoothstep(0.0, 0.5, track);
+                        gl_FragColor.rgb *= (1.0 - depression * 0.35);
                         
-                        // Rougher/More granular in track
-                        float trackNoise = rand(vSandUV * 50.0);
-                        gl_FragColor.rgb += vec3(0.05) * track * trackNoise;
+                        // Particle displacement at edges (pushed up sand)
+                        // Sample gradient to find edges
+                        float texelSize = 1.0 / 512.0;
+                        float trackN = texture2D(uSandMap, vSandUV + vec2(0.0, texelSize)).r;
+                        float trackS = texture2D(uSandMap, vSandUV - vec2(0.0, texelSize)).r;
+                        float trackE = texture2D(uSandMap, vSandUV + vec2(texelSize, 0.0)).r;
+                        float trackW = texture2D(uSandMap, vSandUV - vec2(texelSize, 0.0)).r;
+                        
+                        float gradient = abs(trackN - trackS) + abs(trackE - trackW);
+                        float edge = smoothstep(0.1, 0.3, gradient);
+                        
+                        // Brighter at edges (piled sand)
+                        gl_FragColor.rgb += vec3(0.08, 0.07, 0.05) * edge;
+                        
+                        // Granular detail in disturbed areas
+                        float disturbedGrain = rand(vSandUV * 300.0 + track);
+                        gl_FragColor.rgb += vec3(0.04) * track * disturbedGrain;
                     }
                 }`
             );
